@@ -79,7 +79,7 @@ menu.addEventListener('click', () => {
 document.addEventListener('keydown', event => { if (event.key === 'Escape' && menu.getAttribute('aria-expanded') === 'true') { closeMenu(); menu.focus(); } });
 document.addEventListener('click', event => { if (!event.target.closest('#sidebar, .menu-toggle')) closeMenu(); });
 window.matchMedia('(min-width: 721px)').addEventListener('change', closeMenu);
-const pageNames = { home: '工具广场', ...toolNames, account: '用户中心' };
+const pageNames = { home: '工具广场', ...toolNames, history: '商品利润分析历史记录', account: '用户中心' };
 function route() {
   let target = location.hash.slice(1) || 'home';
   const toolsAnchor = target === 'tools';
@@ -93,6 +93,7 @@ function route() {
   $$('.desktop-nav a').forEach(link => { if (link.hash === `#${target}`) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current'); });
   document.title = `${pageNames[target]} · 灵感 AI`;
   closeMenu(); renderAccount();
+  if (target === 'history') loadHistory();
   $('#main').focus({ preventScroll: true });
   if (toolsAnchor) $('#tools').scrollIntoView(); else window.scrollTo(0, 0);
 }
@@ -286,11 +287,12 @@ $('#profile-form').addEventListener('submit', event => {
   state.profile = { name, role: event.target.elements.role.value }; save(); renderAccount(); savedMessage('个人资料已保存到本地');
 });
 $('#clear-data').addEventListener('click', () => {
-  if (!confirm('确定清除本平台的全部本地提示词、收藏、个人资料和批量商品分析数据吗？此操作不可撤销，请先导出提示词备份。')) return;
+  if (!confirm('确定清除本平台的全部本地提示词、收藏、个人资料、批量商品分析数据和全部分析历史记录吗？此操作不可撤销，请先导出提示词备份。')) return;
   try { localStorage.removeItem(storageKey); storageBroken = false; $('#storage-warning').hidden = true; } catch { storageWarning(); }
   clearBatchData();
+  const historyCleared = clearHistoryData();
   state = emptyData(); $('#profile-form').reset(); $('#profile-form').elements.name.value = ''; $('#profile-form').elements.role.value = state.profile.role;
-  $('#prompt-form').reset(); renderFavorites(); renderPrompts(); savedMessage('平台本地数据已清除');
+  $('#prompt-form').reset(); renderFavorites(); renderPrompts(); savedMessage(historyCleared ? '平台本地数据已清除' : '其他数据已清除，历史记录清除失败，请查看历史页提示');
 });
 // Batch analysis has its own storage key: legacy workspace data remains compatible.
 const batchStorageKey = 'linggan-batch-profit-v1';
@@ -410,6 +412,7 @@ function updateBatch() {
     $('#batch-best-profit').textContent = `${money(best[0].result.profit)} / 件${best.length > 1 ? ` · ${best.length} 款并列` : ''}${bestUnits < 0 ? ' · 全部有效商品均亏损' : ''}`;
   } else { $('#batch-best').textContent = '—'; $('#batch-best-profit').textContent = '添加完整有效的商品，开始比较'; }
   $('#batch-export').disabled = !valid.length || valid.length !== batchRows.length;
+  $('#batch-save-history').disabled = !valid.length || valid.length !== batchRows.length;
   $('#batch-clear').disabled = batchRows.length === 0;
   $('#batch-add').disabled = batchRows.length >= 200;
   $('#batch-empty').hidden = batchRows.length !== 0;
@@ -461,6 +464,154 @@ $('#batch-export').addEventListener('click', () => {
   download('批量商品利润分析.csv', `\uFEFF${header.map(value => batchCsvCell(value)).join(',')}\r\n${records.join('\r\n')}\r\n${summary}\r\n`, 'text/csv;charset=utf-8');
 });
 renderBatchRows();
+
+// Namespace new history by project path; do not migrate or overwrite legacy keys.
+const historyStorageKey = `linggan-profit-history-v1:${location.pathname.replace(/\/index\.html$/, '/').replace(/\/+$/, '') || '/'}`;
+const historyLimit = 100;
+let historyRecords = [];
+let historySelectedId = null;
+let historyReadFailed = false;
+const historyDate = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', dateStyle: 'medium', timeStyle: 'medium' });
+function historyProblem(message) {
+  $('#history-warning').hidden = false;
+  $('#history-warning').textContent = message;
+}
+function validateHistoryRecord(record) {
+  if (!record || typeof record.id !== 'string' || !/^[a-zA-Z0-9-]{1,80}$/.test(record.id) ||
+      typeof record.createdAt !== 'string' || record.createdAt.length !== 24 || !Number.isFinite(Date.parse(record.createdAt)) || new Date(record.createdAt).toISOString() !== record.createdAt ||
+      !Array.isArray(record.rows) || record.rows.length < 1 || record.rows.length > 200 || record.productCount !== record.rows.length ||
+      !Number.isFinite(record.totalProfit) || !record.rows.every(validBatchDraft)) return false;
+  const results = record.rows.map(analyzeBatchRow);
+  if (results.some(result => Object.keys(result.errors).length)) return false;
+  const total = results.reduce((sum, result) => sum + result.profit, 0);
+  return Math.abs(total - record.totalProfit) <= 0.000001;
+}
+function readHistoryRecords() {
+  try {
+    const raw = localStorage.getItem(historyStorageKey);
+    if (raw === null) { historyReadFailed = false; return []; }
+    const saved = JSON.parse(raw);
+    if (saved?.version !== 1 || !Array.isArray(saved.records) || saved.records.length > historyLimit ||
+        !saved.records.every(validateHistoryRecord) || new Set(saved.records.map(record => record.id)).size !== saved.records.length) throw new Error('Invalid history');
+    historyReadFailed = false;
+    // Pick known fields only; user-controlled values are never inserted as HTML.
+    return saved.records.map(record => ({ id: record.id, createdAt: record.createdAt, productCount: record.productCount, totalProfit: record.totalProfit,
+      rows: record.rows.map(row => Object.fromEntries(batchFields.map(([key]) => [key, row[key]]))) }));
+  } catch {
+    historyReadFailed = true;
+    historyProblem('历史记录读取失败：浏览器存储不可用或数据已损坏。原始数据不会被覆盖。可检查浏览器权限后重试；确认不再需要原始数据后，可清空全部历史记录。');
+    return null;
+  }
+}
+function loadHistory() {
+  const records = readHistoryRecords();
+  if (records !== null) { historyRecords = records; $('#history-warning').hidden = true; }
+  else historyRecords = [];
+  renderHistory();
+}
+function commitHistory(records, successMessage) {
+  try {
+    localStorage.setItem(historyStorageKey, JSON.stringify({ version: 1, records }));
+  } catch {
+    historyProblem('历史记录操作未保存：浏览器存储被禁用或空间不足。原有历史记录仍保留；请释放存储空间或调整权限后重试。本次分析仍可使用 CSV 导出。');
+    toast('历史记录未保存，请查看历史页提示');
+    return false;
+  }
+  historyRecords = records; historyReadFailed = false; $('#history-warning').hidden = true;
+  renderHistory(); toast(successMessage); return true;
+}
+function cleanHistoryRows(rows) { return rows.map(row => Object.fromEntries(batchFields.map(([key]) => [key, row[key].trim()]))); }
+$('#batch-save-history').addEventListener('click', () => {
+  if (!batchRows.length || batchRows.some(row => Object.keys(analyzeBatchRow(row).errors).length)) { toast('请先完善全部商品数据再保存历史'); return; }
+  const latest = readHistoryRecords();
+  if (latest === null) { renderHistory(); toast('无法读取历史记录，未创建新记录；请查看历史页提示'); return; }
+  if (latest.length >= historyLimit) { historyRecords = latest; renderHistory(); toast('历史记录已达 100 条，请先删除不需要的记录'); return; }
+  const rows = cleanHistoryRows(batchRows);
+  const record = { id: uid(), createdAt: new Date().toISOString(), productCount: rows.length,
+    totalProfit: rows.reduce((sum, row) => sum + analyzeBatchRow(row).profit, 0), rows };
+  commitHistory([record, ...latest], '本次分析已保存到历史记录');
+});
+function renderHistory() {
+  const list = $('#history-list'); list.replaceChildren();
+  if (!historyRecords.length) list.append(element('p', historyReadFailed ? '历史记录暂时无法读取，请查看上方提示。' : '暂无历史记录。前往批量分析器，保存第一份分析快照。', 'empty'));
+  for (const record of historyRecords) {
+    const card = element('article', undefined, 'panel history-card');
+    const time = element('time', historyDate.format(new Date(record.createdAt))); time.dateTime = record.createdAt;
+    card.append(time, element('p', `${record.productCount} 款商品 · 总利润 ${money(record.totalProfit)}`, 'history-card-summary'));
+    const names = record.rows.slice(0, 3).map(row => row.name).join('、');
+    card.append(element('p', `${names}${record.rows.length > 3 ? ' 等' : ''}`, 'history-names'));
+    const actions = element('div', undefined, 'button-row');
+    for (const [action, label] of [['view', '查看详情'], ['restore', '恢复到分析器'], ['delete', '删除记录']]) {
+      const button = element('button', label, `button ${action === 'delete' ? 'danger' : 'secondary'}`);
+      button.type = 'button'; button.dataset.historyAction = action; button.dataset.historyId = record.id;
+      button.setAttribute('aria-label', `${label}：${historyDate.format(new Date(record.createdAt))}，${record.productCount} 款商品`);
+      actions.append(button);
+    }
+    card.append(actions); list.append(card);
+  }
+  $('#history-count').textContent = historyReadFailed ? '无法确认历史记录数量' : `共 ${historyRecords.length} 条历史记录 · 最多 ${historyLimit} 条`;
+  $('#history-clear').disabled = !historyRecords.length && !historyReadFailed;
+  const selected = historyRecords.find(record => record.id === historySelectedId);
+  $('#history-detail').hidden = !selected;
+  if (selected) renderHistoryDetail(selected); else historySelectedId = null;
+}
+function renderHistoryDetail(record) {
+  const summary = $('#history-detail-summary'); summary.replaceChildren();
+  summary.append(element('p', `保存日期：${historyDate.format(new Date(record.createdAt))}（北京时间）`, 'hint'),
+    element('p', `${record.productCount} 款商品 · 总利润 ${money(record.totalProfit)}`, 'history-card-summary'));
+  const list = $('#history-detail-items'); list.replaceChildren();
+  for (const [index, row] of record.rows.entries()) {
+    const result = analyzeBatchRow(row); const card = element('article', undefined, 'history-product');
+    card.append(element('h3', `${index + 1}. ${row.name}`),
+      element('p', `成本 ${money(Number(row.cost))} · 售价 ${money(Number(row.price))} · 运费 ${money(Number(row.shipping))} · 费率 ${row.rate}%`, 'hint'));
+    const values = element('dl', undefined, 'batch-results');
+    for (const [label, text] of [['单件利润', money(result.profit)], ['利润率', `${result.margin.toFixed(2)}%`], ['平台费用', money(result.fee)], ['保本售价', result.breakEvenText]]) {
+      const cell = element('div'); cell.append(element('dt', label), element('dd', text)); values.append(cell);
+    }
+    if (result.profitUnits < 0) card.append(element('span', '亏损商品', 'badge history-loss'));
+    card.append(values); list.append(card);
+  }
+}
+function restoreHistory(id) {
+  const latest = readHistoryRecords(); if (latest === null) { renderHistory(); toast('历史记录无法读取，未恢复'); return; }
+  const record = latest.find(item => item.id === id);
+  if (!record) { historyRecords = latest; renderHistory(); toast('该记录已不存在'); return; }
+  if (batchRows.length && !confirm('恢复此历史记录将替换当前批量分析草稿，未保存的修改会丢失。是否继续？历史记录本身不会改变。')) return;
+  if (batchStorageBroken) { toast('当前商品草稿存储异常，请先在批量分析器中处理存储问题'); return; }
+  const rows = cleanHistoryRows(record.rows);
+  try { localStorage.setItem(batchStorageKey, JSON.stringify({ version: 1, rows })); }
+  catch { warnBatchStorage(); toast('恢复未完成：草稿无法保存，当前商品未被替换'); return; }
+  batchRows = rows.map(row => ({ id: uid(), ...row })); renderBatchRows();
+  $('#batch-save-status').textContent = '已从历史记录恢复，并自动保存当前草稿';
+  location.hash = 'batch-profit'; toast('历史记录已恢复到批量分析器');
+}
+$('#history-list').addEventListener('click', event => {
+  const button = event.target.closest('[data-history-action]'); if (!button) return;
+  const id = button.dataset.historyId;
+  if (button.dataset.historyAction === 'view') {
+    const latest = readHistoryRecords(); if (latest === null) { renderHistory(); return; }
+    historyRecords = latest; historySelectedId = id; renderHistory();
+    if (!$('#history-detail').hidden) { $('#history-detail').scrollIntoView({ block: 'start' }); $('#history-detail-close').focus({ preventScroll: true }); }
+  }
+  if (button.dataset.historyAction === 'restore') restoreHistory(id);
+  if (button.dataset.historyAction === 'delete' && confirm('确定删除此条历史记录吗？当前分析草稿和其他历史记录不会被删除。')) {
+    const latest = readHistoryRecords(); if (latest === null) return;
+    commitHistory(latest.filter(record => record.id !== id), '历史记录已删除');
+  }
+});
+$('#history-detail-close').addEventListener('click', () => { historySelectedId = null; renderHistory(); $('#history-clear').focus(); });
+$('#history-detail-restore').addEventListener('click', () => { if (historySelectedId) restoreHistory(historySelectedId); });
+function clearHistoryData() {
+  try { localStorage.removeItem(historyStorageKey); }
+  catch { historyProblem('清空历史记录失败：浏览器拒绝访问存储，原有历史记录未被确认删除。'); return false; }
+  historyRecords = []; historySelectedId = null; historyReadFailed = false;
+  $('#history-warning').hidden = true; renderHistory(); return true;
+}
+$('#history-clear').addEventListener('click', () => {
+  if (confirm('确定清空此项目的全部分析历史记录吗？此操作不可撤销；当前批量分析草稿、提示词和个人资料不会改变。') && clearHistoryData()) toast('全部历史记录已清空');
+});
+window.addEventListener('storage', event => { if (event.key === historyStorageKey || event.key === null) loadHistory(); });
+loadHistory();
 
 $('#year').textContent = new Date().getFullYear();
 renderFavorites(); renderPrompts(); route();

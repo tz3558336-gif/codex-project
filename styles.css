@@ -19,3 +19,16 @@
 @media(max-width:1180px){.batch-fields{grid-template-columns:repeat(2,minmax(0,1fr))}.batch-fields>label:first-child{grid-column:1/-1}}
 @media(max-width:900px){.batch-summary{grid-template-columns:1fr}.batch-summary .panel{padding:18px 20px}.batch-summary strong{margin:7px 0;font-size:26px}.batch-results{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:380px){.batch-fields{grid-template-columns:1fr}.batch-toolbar .button-row{width:100%}.batch-toolbar .button{flex:1;white-space:nowrap;font-size:10px;padding:10px}.batch-toolbar #batch-clear{flex-basis:100%}.batch-results dd{font-size:14px}}
+
+/* Saved analysis snapshots keep the same white / purple workspace style. */
+.history-toolbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:20px}
+.history-toolbar .hint{margin:0 0 0 auto}.history-layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.2fr);gap:22px;align-items:start}
+.history-layout:not(:has(#history-detail:not([hidden]))){grid-template-columns:1fr}
+.history-card{margin-bottom:16px}.history-card time{font-size:12px;color:#777083}
+.history-card-summary{font-size:16px;font-weight:600;color:var(--purple);margin:12px 0;overflow-wrap:anywhere}
+.history-names{font-size:12px;color:var(--muted);overflow-wrap:anywhere}.history-card .button{font-size:10px;padding:9px 12px}
+#history-detail{scroll-margin-top:95px;min-width:0}.history-product{border-top:1px solid var(--line);padding-top:22px;margin-top:24px}
+.history-product h3{font-size:14px;margin-bottom:8px;overflow-wrap:anywhere}.history-product .hint{overflow-wrap:anywhere}
+.history-product .batch-results{grid-template-columns:repeat(2,minmax(0,1fr))}.history-loss{background:#fbe9ee;color:#ac405a}
+@media(max-width:1100px){.history-layout{grid-template-columns:1fr}.history-toolbar .hint{width:100%;margin-left:0}}
+@media(max-width:380px){.history-toolbar .button{width:100%}.history-card .button-row{gap:7px}.history-card .button{flex:1;font-size:9px;padding-inline:7px}.history-card-summary{font-size:14px}}

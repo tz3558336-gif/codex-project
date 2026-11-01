@@ -199,7 +199,7 @@ const base = process.env.TEST_BASE_URL || 'http://127.0.0.1:8000';
   // Responsive routes, overflow, mobile menu, and anchor targets.
   for (const width of [1440, 1024, 768, 720, 375, 320]) {
     await page.setViewportSize({ width, height: 900 });
-    for (const route of ['home', 'article', 'title', 'profit', 'batch-profit', 'text', 'prompts', 'account']) {
+    for (const route of ['home', 'article', 'title', 'profit', 'batch-profit', 'history', 'text', 'prompts', 'account']) {
       await go(route);
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, `Overflow ${width}px / ${route}`);
     }
@@ -209,11 +209,11 @@ const base = process.env.TEST_BASE_URL || 'http://127.0.0.1:8000';
       await page.locator('.menu-toggle').click(); await page.locator('[data-route="profit"]').click();
       await page.locator('[data-page="profit"]:visible').waitFor(); assert.equal(await page.locator('.menu-toggle').getAttribute('aria-expanded'), 'false');
     }
-    console.log(`PASS ${width}px all 8 routes and mobile navigation`);
+    console.log(`PASS ${width}px all 9 routes and mobile navigation`);
   }
   await page.setViewportSize({width:1440,height:1100}); await go('home');
   const links = await page.locator('a').evaluateAll(nodes => nodes.map(a => a.getAttribute('href')));
-  const routes = ['home','article','title','profit','batch-profit','text','prompts','account','tools','main'];
+  const routes = ['home','article','title','profit','batch-profit','history','text','prompts','account','tools','main'];
   assert.ok(links.every(href => href?.startsWith('https://github.com/') || (href?.startsWith('#') && routes.includes(href.slice(1)))));
   await page.goto(`${base}/#invalid`); await page.waitForURL('**/#home');
   await page.goto(`${base}/#tools`); await page.locator('#tools').waitFor(); assert.equal(await page.locator('[data-page="home"]').isVisible(), true);
@@ -281,5 +281,6 @@ const base = process.env.TEST_BASE_URL || 'http://127.0.0.1:8000';
 
   assert.deepEqual(errors, []); assert.equal(externalRequests, 0);
   console.log('PASS storage denial resilience, no browser/resource errors or external AI calls');
+  await require('./profit-history.cjs')(browser, base);
   await browser.close();
 })().catch(error => { console.error(error); process.exit(1); });
