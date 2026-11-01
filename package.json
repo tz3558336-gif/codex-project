@@ -1,0 +1,13 @@
+{
+  "name": "linggan-ai-tools",
+  "version": "1.0.0",
+  "private": true,
+  "description": "GitHub Pages compatible Chinese AI tools workspace",
+  "scripts": {
+    "check": "node --check script.js",
+    "test": "node tests/browser.cjs"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}
