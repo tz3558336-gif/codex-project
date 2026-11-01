@@ -25,12 +25,12 @@ const base = process.env.TEST_BASE_URL || 'http://127.0.0.1:8000';
     return read(Buffer.concat(chunks).toString('utf8'));
   };
   // Navigation, tools, search, favorites.
-  assert.equal(await page.locator('.tool-card[data-tool]:visible').count(), 5);
+  assert.equal(await page.locator('.tool-card[data-tool]:visible').count(), 6);
   await page.getByRole('button', { name: '电商工具', exact: true }).click();
-  assert.equal(await page.locator('.tool-card[data-tool]:visible').count(), 2);
+  assert.equal(await page.locator('.tool-card[data-tool]:visible').count(), 3);
   await page.locator('[data-filter="all"]').click();
   await page.locator('#tool-search').fill('不存在'); await page.locator('#tools-empty:visible').waitFor();
-  await page.locator('#tool-search').fill('利润'); assert.equal(await page.locator('.tool-card[data-tool]:visible').count(), 1);
+  await page.locator('#tool-search').fill('利润'); assert.equal(await page.locator('.tool-card[data-tool]:visible').count(), 2);
   await page.locator('[data-favorite="profit"]').click();
   await page.locator('#tool-search').fill(''); await page.locator('[data-filter="favorites"]').click();
   assert.equal(await page.locator('.tool-card[data-tool]:visible').count(), 1);
@@ -76,6 +76,79 @@ const base = process.env.TEST_BASE_URL || 'http://127.0.0.1:8000';
   await fill('profit-form', { price: 0 }); assert.equal(await page.locator('#profit-form').evaluate(form => form.checkValidity()), false);
   await page.locator('#profit-form button[type="reset"]').click(); assert.equal(await page.locator('#profit-value').innerText(), '—');
   console.log('PASS profit calculations, losses, boundaries, validation and CSV export');
+  // Batch analyzer: live calculations, invalid drafts, aggregates, persistence and CSV.
+  await go('batch-profit');
+  const workspaceBeforeBatch = await page.evaluate(() => localStorage.getItem('linggan-workspace-v1'));
+  const batchRow = index => page.locator('.batch-row').nth(index);
+  const addBatch = async values => {
+    await page.locator('#batch-add').click(); const row = page.locator('.batch-row').last();
+    for (const [key, value] of Object.entries(values)) await row.locator(`[data-field="${key}"]`).fill(String(value));
+  };
+  const result = async (index, key) => batchRow(index).locator(`[data-result="${key}"]`).innerText();
+  await addBatch({ name: '商品A', cost: 40, price: 100, shipping: 10, rate: 5 });
+  assert.equal(await result(0, 'profit'), '¥45.00'); assert.equal(await result(0, 'margin'), '45.00%');
+  assert.equal(await result(0, 'fee'), '¥5.00'); assert.equal(await result(0, 'breakEven'), '¥52.63');
+  await addBatch({ name: '亏损商品', cost: 120, price: 100, shipping: 10, rate: 5 });
+  assert.equal(await result(1, 'profit'), '¥-35.00'); assert.equal(await result(1, 'margin'), '-35.00%');
+  await addBatch({ name: '零费率', cost: 10, price: 20, shipping: 2, rate: 0 });
+  assert.equal(await result(2, 'profit'), '¥8.00'); assert.equal(await result(2, 'fee'), '¥0.00'); assert.equal(await result(2, 'breakEven'), '¥12.00');
+  await addBatch({ name: '百分百费率', cost: 10, price: 20, shipping: 2, rate: 100 });
+  assert.equal(await result(3, 'profit'), '¥-12.00'); assert.match(await result(3, 'breakEven'), /无法保本/);
+  assert.equal(await page.locator('#batch-total').innerText(), '¥6.00');
+  assert.equal(await page.locator('#batch-loss-count').innerText(), '2'); assert.equal(await page.locator('.batch-row-loss').count(), 2);
+  assert.equal(await page.locator('#batch-best').innerText(), '商品A');
+  await addBatch({ name: '零成本百分百', cost: 0, price: 20, shipping: 0, rate: 100 });
+  assert.equal(await result(4, 'profit'), '¥0.00'); assert.match(await result(4, 'breakEven'), /任意正售价均保本/);
+  await addBatch({ name: '并列最高', cost: 40, price: 100, shipping: 10, rate: 5 });
+  assert.match(await page.locator('#batch-best').innerText(), /商品A、并列最高/);
+  await page.locator('[data-batch-delete]').last().click(); assert.equal(await page.locator('#batch-best').innerText(), '商品A');
+  await page.locator('#batch-add').click(); assert.equal(await page.locator('#batch-export').isDisabled(), true);
+  assert.match(await page.locator('#batch-count').innerText(), /5 \/ 6 行有效/); assert.equal(await page.locator('#batch-total').innerText(), '¥6.00');
+  await page.locator('[data-batch-delete]').last().click();
+  for (const [key, value] of [['price','0'],['cost','-1'],['rate','101'],['rate','NaN'],['rate','Infinity'],['cost','1000000001'],['rate','1e2'],['cost','0.001'],['name','   ']]) {
+    const input = batchRow(0).locator(`[data-field="${key}"]`); const original = await input.inputValue();
+    await input.fill(value); assert.equal(await result(0, 'profit'), '—'); assert.equal(await input.getAttribute('aria-invalid'), 'true');
+    assert.equal(await page.locator('#batch-export').isDisabled(), true); await input.fill(original);
+  }
+  await batchRow(0).locator('[data-field="name"]').fill('=SUM(1,2) "商品"');
+  await page.reload(); assert.equal(await page.locator('.batch-row').count(), 5); assert.equal(await page.locator('#batch-total').innerText(), '¥6.00');
+  assert.equal(await batchRow(0).locator('[data-field="name"]').inputValue(), '=SUM(1,2) "商品"');
+  // Parse the emitted CSV rather than merely checking that a download happened.
+  const parseCsv = body => {
+    const rows = []; let row = [], cell = '', quoted = false;
+    const input = body.replace(/^\uFEFF/, '');
+    for (let i = 0; i < input.length; i++) {
+      const c = input[i];
+      if (c === '"') { if (quoted && input[i + 1] === '"') { cell += '"'; i++; } else quoted = !quoted; }
+      else if (!quoted && c === ',') { row.push(cell); cell = ''; }
+      else if (!quoted && c === '\r' && input[i + 1] === '\n') { row.push(cell); rows.push(row); row = []; cell = ''; i++; }
+      else cell += c;
+    }
+    return rows;
+  };
+  await download(page.locator('#batch-export'), body => {
+    const rows = parseCsv(body); assert.equal(rows.length, 7); assert.ok(rows.every(row => row.length === 10));
+    assert.equal(rows[1][0], '\'=SUM(1,2) "商品"'); assert.equal(rows[1][5], '45.00'); assert.equal(rows[1][8], '52.63');
+    assert.equal(rows[2][9], '亏损'); assert.match(rows[4][8], /无法保本/); assert.match(rows[5][8], /任意正售价/); assert.equal(rows[6][5], '6.00');
+    assert.ok(!body.includes('NaN')); assert.ok(!body.includes('Infinity'));
+  });
+  page.once('dialog', dialog => dialog.dismiss()); await page.locator('#batch-clear').click(); assert.equal(await page.locator('.batch-row').count(), 5);
+  page.once('dialog', dialog => dialog.accept()); await page.locator('#batch-clear').click();
+  assert.equal(await page.locator('.batch-row').count(), 0); assert.equal(await page.locator('#batch-total').innerText(), '—');
+  assert.equal(await page.evaluate(() => localStorage.getItem('linggan-workspace-v1')), workspaceBeforeBatch);
+  await page.reload(); assert.equal(await page.locator('.batch-row').count(), 0);
+  await addBatch({ name: '小数精度', cost: '0.10', price: '0.30', shipping: '0.10', rate: 0 });
+  assert.equal(await result(0, 'profit'), '¥0.10');
+  await batchRow(0).locator('[data-field="cost"]').fill(''); await page.reload();
+  assert.equal(await batchRow(0).locator('[data-field="cost"]').inputValue(), ''); assert.equal(await page.locator('#batch-export').isDisabled(), true);
+  await batchRow(0).locator('[data-field="cost"]').fill('0.10');
+  // Keep a filled row through every viewport test below.
+  await go('home'); await page.locator('[data-filter="all"]').click();
+  await page.locator('[data-favorite="batch-profit"]').click(); await go('account');
+  await page.locator('#account-favorite-list a[href="#batch-profit"]').waitFor();
+  await go('home'); await page.locator('[data-favorite="batch-profit"]').click();
+  console.log('PASS batch live profits, losses, zero/100% fee, ties, validation, CSV safety, draft persistence and isolated clearing');
+
   // All local text options and literal replacement with Unicode.
   await go('text');
   await page.locator('#text-input').fill('  Apple  \n\nApple\n banana \nBANANA\n😀');
@@ -126,7 +199,7 @@ const base = process.env.TEST_BASE_URL || 'http://127.0.0.1:8000';
   // Responsive routes, overflow, mobile menu, and anchor targets.
   for (const width of [1440, 1024, 768, 720, 375, 320]) {
     await page.setViewportSize({ width, height: 900 });
-    for (const route of ['home', 'article', 'title', 'profit', 'text', 'prompts', 'account']) {
+    for (const route of ['home', 'article', 'title', 'profit', 'batch-profit', 'text', 'prompts', 'account']) {
       await go(route);
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, `Overflow ${width}px / ${route}`);
     }
@@ -136,17 +209,19 @@ const base = process.env.TEST_BASE_URL || 'http://127.0.0.1:8000';
       await page.locator('.menu-toggle').click(); await page.locator('[data-route="profit"]').click();
       await page.locator('[data-page="profit"]:visible').waitFor(); assert.equal(await page.locator('.menu-toggle').getAttribute('aria-expanded'), 'false');
     }
-    console.log(`PASS ${width}px all 7 routes and mobile navigation`);
+    console.log(`PASS ${width}px all 8 routes and mobile navigation`);
   }
   await page.setViewportSize({width:1440,height:1100}); await go('home');
   const links = await page.locator('a').evaluateAll(nodes => nodes.map(a => a.getAttribute('href')));
-  const routes = ['home','article','title','profit','text','prompts','account','tools','main'];
+  const routes = ['home','article','title','profit','batch-profit','text','prompts','account','tools','main'];
   assert.ok(links.every(href => href?.startsWith('https://github.com/') || (href?.startsWith('#') && routes.includes(href.slice(1)))));
   await page.goto(`${base}/#invalid`); await page.waitForURL('**/#home');
   await page.goto(`${base}/#tools`); await page.locator('#tools').waitFor(); assert.equal(await page.locator('[data-page="home"]').isVisible(), true);
   await go('account'); page.once('dialog', dialog => dialog.dismiss()); await page.locator('#clear-data').click(); assert.equal(await page.locator('#account-prompts').innerText(), '1');
   page.once('dialog', dialog => dialog.accept()); await page.locator('#clear-data').click();
   assert.equal(await page.locator('#account-prompts').innerText(), '0'); assert.equal(await page.locator('#account-favorites').innerText(), '0');
+  assert.equal(await page.locator('.batch-row').count(), 0);
+  assert.equal(await page.evaluate(() => localStorage.getItem('linggan-batch-profit-v1')), null);
   await page.reload(); assert.equal(await page.locator('#account-prompts').innerText(), '0');
   console.log('PASS clipboard, profile, links, hash routing, clear-data confirm/cancel');
   // Denied storage: tools remain functional, warning prevents persistence claim.
@@ -156,7 +231,54 @@ const base = process.env.TEST_BASE_URL || 'http://127.0.0.1:8000';
   assert.equal(await deniedPage.locator('#storage-warning').isVisible(), true);
   await deniedPage.locator('[name="cost"]').fill('40'); await deniedPage.locator('[name="price"]').fill('100'); await deniedPage.locator('[name="shipping"]').fill('10'); await deniedPage.locator('[name="rate"]').fill('5');
   await deniedPage.locator('#profit-form button[type="submit"]').click(); assert.equal(await deniedPage.locator('#profit-value').innerText(), '¥45.00');
+  await deniedPage.goto(`${base}/#batch-profit`);
+  assert.equal(await deniedPage.locator('#batch-warning').isVisible(), true);
+  await deniedPage.locator('#batch-add').click();
+  for (const [key, value] of Object.entries({name:'离线商品', cost:'40', price:'100', shipping:'10', rate:'5'})) await deniedPage.locator(`.batch-row [data-field="${key}"]`).fill(value);
+  assert.equal(await deniedPage.locator('[data-result="profit"]').innerText(), '¥45.00');
+  assert.match(await deniedPage.locator('#batch-save-status').innerText(), /尚未持久保存/);
   await denied.close();
+  // Independent edge cases: all-loss ranking, 99.99%, large values and corrupt/quota storage.
+  const edgeContext = await browser.newContext();
+  const edgePage = await edgeContext.newPage();
+  await edgePage.goto(`${base}/#batch-profit`);
+  await edgePage.evaluate(() => localStorage.setItem('linggan-batch-profit-v1', JSON.stringify({version:1, rows:[
+    {name:'亏损较多',cost:'10',price:'5',shipping:'0',rate:'0'},
+    {name:'亏损较少',cost:'6',price:'5',shipping:'0',rate:'0'}
+  ]})));
+  await edgePage.reload();
+  assert.equal(await edgePage.locator('#batch-best').innerText(), '亏损较少');
+  assert.match(await edgePage.locator('#batch-best-profit').innerText(), /全部有效商品均亏损/);
+  assert.equal(await edgePage.locator('#batch-total').innerText(), '¥-6.00');
+  const edgeRow = edgePage.locator('.batch-row').last();
+  await edgeRow.locator('[data-field="rate"]').fill('99.99');
+  assert.equal(await edgeRow.locator('[data-result="breakEven"]').innerText(), '¥60,000.00');
+  for (const key of ['cost','price','shipping']) await edgeRow.locator(`[data-field="${key}"]`).fill('1000000000');
+  assert.equal(await edgeRow.locator('[data-result="breakEven"]').innerText(), '¥20,000,000,000,000.00');
+  assert.ok(!/NaN|Infinity/.test(await edgePage.locator('.batch-summary').innerText()));
+  await edgePage.evaluate(() => {
+    const original = Storage.prototype.setItem;
+    Storage.prototype.setItem = function(key,value) { if(key==='linggan-batch-profit-v1') throw new DOMException('Full','QuotaExceededError'); return original.call(this,key,value); };
+  });
+  await edgeRow.locator('[data-field="name"]').fill('配额不足时的修改');
+  assert.equal(await edgePage.locator('#batch-warning').isVisible(), true);
+  assert.match(await edgePage.locator('#batch-save-status').innerText(), /尚未持久保存/);
+  await edgeContext.close();
+  const corruptContext = await browser.newContext();
+  const corruptPage = await corruptContext.newPage();
+  await corruptPage.goto(`${base}/#batch-profit`);
+  await corruptPage.evaluate(() => localStorage.setItem('linggan-batch-profit-v1', '{broken'));
+  await corruptPage.reload();
+  assert.equal(await corruptPage.locator('#batch-warning').isVisible(), true);
+  await corruptPage.locator('#batch-add').click();
+  assert.equal(await corruptPage.evaluate(() => localStorage.getItem('linggan-batch-profit-v1')), '{broken');
+  corruptPage.once('dialog', dialog => dialog.accept()); await corruptPage.locator('#batch-clear').click();
+  await corruptPage.locator('#batch-add').click();
+  assert.notEqual(await corruptPage.evaluate(() => localStorage.getItem('linggan-batch-profit-v1')), '{broken');
+  assert.equal(await corruptPage.locator('#batch-warning').isVisible(), false);
+  await corruptContext.close();
+  console.log('PASS all-loss ranking, 99.99% fee, max amounts, storage quota and corrupted-data recovery');
+
   assert.deepEqual(errors, []); assert.equal(externalRequests, 0);
   console.log('PASS storage denial resilience, no browser/resource errors or external AI calls');
   await browser.close();
