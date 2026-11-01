@@ -16,7 +16,7 @@ window.LingganAI = Object.freeze({
 });
 const $ = selector => document.querySelector(selector);
 const $$ = selector => [...document.querySelectorAll(selector)];
-const toolNames = { article: 'AI 文章生成器', title: '电商标题生成器', profit: '商品利润计算器', text: '批量文本处理', prompts: 'AI 提示词管理' };
+const toolNames = { article: 'AI 文章生成器', title: '电商标题生成器', profit: '商品利润计算器', 'batch-profit': '批量商品利润分析器', text: '批量文本处理', prompts: 'AI 提示词管理' };
 const categories = ['写作', '电商', '效率', '其他'];
 const storageKey = 'linggan-workspace-v1';
 const emptyData = () => ({ prompts: [], favorites: [], profile: { name: '', role: '内容创作者' } });
@@ -286,10 +286,181 @@ $('#profile-form').addEventListener('submit', event => {
   state.profile = { name, role: event.target.elements.role.value }; save(); renderAccount(); savedMessage('个人资料已保存到本地');
 });
 $('#clear-data').addEventListener('click', () => {
-  if (!confirm('确定清除本平台的全部本地提示词、收藏和个人资料吗？此操作不可撤销，请先导出提示词备份。')) return;
+  if (!confirm('确定清除本平台的全部本地提示词、收藏、个人资料和批量商品分析数据吗？此操作不可撤销，请先导出提示词备份。')) return;
   try { localStorage.removeItem(storageKey); storageBroken = false; $('#storage-warning').hidden = true; } catch { storageWarning(); }
+  clearBatchData();
   state = emptyData(); $('#profile-form').reset(); $('#profile-form').elements.name.value = ''; $('#profile-form').elements.role.value = state.profile.role;
   $('#prompt-form').reset(); renderFavorites(); renderPrompts(); savedMessage('平台本地数据已清除');
 });
+// Batch analysis has its own storage key: legacy workspace data remains compatible.
+const batchStorageKey = 'linggan-batch-profit-v1';
+const batchFields = [
+  ['name', '商品名称', '例如：保温杯'], ['cost', '商品成本（元）', '0.00'],
+  ['price', '销售价格（元）', '0.00'], ['shipping', '运费（元）', '0.00'],
+  ['rate', '平台费率（%）', '0–100']
+];
+let batchRows = [];
+let batchStorageBroken = false;
+function warnBatchStorage() {
+  batchStorageBroken = true;
+  $('#batch-warning').hidden = false;
+  $('#batch-warning').textContent = '本地存储不可用、已满或保存的数据损坏。修改仅保留在本次页面；请及时导出 CSV。损坏的原始数据不会被自动覆盖。';
+  $('#batch-save-status').textContent = '尚未持久保存 · 仅本次页面有效';
+}
+function validBatchDraft(row) {
+  return row && batchFields.every(([key]) => typeof row[key] === 'string' && row[key].length <= (key === 'name' ? 100 : 32));
+}
+try {
+  const raw = localStorage.getItem(batchStorageKey);
+  if (raw !== null) {
+    const saved = JSON.parse(raw);
+    if (saved?.version !== 1 || !Array.isArray(saved.rows) || saved.rows.length > 200 || !saved.rows.every(validBatchDraft)) throw new Error('Invalid batch data');
+    batchRows = saved.rows.map(row => ({ id: uid(), ...Object.fromEntries(batchFields.map(([key]) => [key, row[key]])) }));
+    $('#batch-save-status').textContent = '已恢复此浏览器保存的商品草稿';
+  }
+} catch { warnBatchStorage(); }
+function saveBatch() {
+  if (batchStorageBroken) return;
+  try {
+    localStorage.setItem(batchStorageKey, JSON.stringify({ version: 1, rows: batchRows.map(row => Object.fromEntries(batchFields.map(([key]) => [key, row[key]]))) }));
+    $('#batch-save-status').textContent = '商品草稿已自动保存到当前浏览器（含待完善行）';
+  } catch { warnBatchStorage(); }
+}
+function analyzeBatchRow(row) {
+  const errors = {};
+  if (!row.name.trim() || row.name.length > 100) errors.name = '请填写 1–100 字符的商品名称';
+  const values = {};
+  for (const [key, label] of batchFields.slice(1)) {
+    const raw = row[key].trim();
+    const value = Number(raw);
+    const max = key === 'rate' ? 100 : 1000000000;
+    if (!/^(?:\d+|\d*\.\d{1,2})$/.test(raw) || !Number.isFinite(value) || value < 0 || value > max || (key === 'price' && value === 0)) {
+      errors[key] = `${label}须${key === 'price' ? '大于 0 且' : ''}在 0–${max === 100 ? '100' : '10亿元'}范围，最多两位小数`;
+    } else { values[key] = Math.round(value * 100); }
+  }
+  if (Object.keys(errors).length) return { errors };
+  const { cost, price, shipping, rate } = values;
+  // Cents × fee basis points fit safely in integers under the validated limits.
+  // Profit units are millionths of a yuan; compare before display rounding.
+  const profitUnits = price * (10000 - rate) - (cost + shipping) * 10000;
+  const fee = price * rate / 1000000;
+  const profit = profitUnits / 1000000;
+  const margin = profitUnits / (price * 10000) * 100;
+  const breakEven = rate === 10000 ? null : (cost + shipping) * 100 / (10000 - rate);
+  if (![fee, profit, margin].every(Number.isFinite) || (breakEven !== null && !Number.isFinite(breakEven))) return { errors: { price: '金额超出可计算范围' } };
+  return { errors, fee, profit, profitUnits, margin, breakEven,
+    breakEvenText: breakEven === null ? (cost + shipping === 0 ? '任意正售价均保本' : '无法保本（费率 100%）') : money(breakEven) };
+}
+function renderBatchRows() {
+  const list = $('#batch-rows'); list.replaceChildren();
+  batchRows.forEach((row, index) => {
+    const card = element('article', undefined, 'panel batch-row'); card.dataset.id = row.id;
+    card.setAttribute('aria-label', `商品 ${index + 1}`);
+    const heading = element('div', undefined, 'panel-heading');
+    heading.append(element('h2', `商品 ${index + 1}`));
+    const remove = element('button', '删除商品', 'button danger'); remove.type = 'button'; remove.dataset.batchDelete = row.id;
+    remove.setAttribute('aria-label', `删除商品 ${index + 1}`); heading.append(remove);
+    const fields = element('div', undefined, 'batch-fields');
+    for (const [key, label, placeholder] of batchFields) {
+      const field = element('label', label); const input = element('input');
+      input.type = 'text'; input.dataset.field = key; input.value = row[key]; input.placeholder = placeholder;
+      input.maxLength = key === 'name' ? 100 : 32; input.required = true;
+      if (key !== 'name') input.inputMode = 'decimal';
+      input.setAttribute('aria-describedby', `batch-error-${row.id}`); field.append(input); fields.append(field);
+    }
+    const error = element('p', undefined, 'batch-error'); error.id = `batch-error-${row.id}`;
+    const results = element('dl', undefined, 'batch-results');
+    for (const [key, label] of [['profit', '单件利润'], ['margin', '利润率'], ['fee', '平台费用'], ['breakEven', '保本售价']]) {
+      const cell = element('div'); const output = element('dd', '—'); output.dataset.result = key;
+      cell.append(element('dt', label), output); results.append(cell);
+    }
+    const badge = element('span', '', 'badge neutral'); badge.dataset.batchState = '';
+    card.append(heading, fields, error, results, badge); list.append(card);
+  });
+  updateBatch();
+}
+function updateBatch() {
+  const valid = [];
+  for (const row of batchRows) {
+    const result = analyzeBatchRow(row);
+    const card = [...$('#batch-rows').children].find(node => node.dataset.id === row.id);
+    const isValid = !Object.keys(result.errors).length;
+    for (const input of card.querySelectorAll('[data-field]')) {
+      const error = result.errors[input.dataset.field] || '';
+      input.setAttribute('aria-invalid', String(!!error)); input.setCustomValidity(error);
+    }
+    card.querySelector('.batch-error').textContent = Object.values(result.errors).join('；');
+    const outputs = { profit: isValid ? money(result.profit) : '—', margin: isValid ? `${result.margin.toFixed(2)}%` : '—', fee: isValid ? money(result.fee) : '—', breakEven: isValid ? result.breakEvenText : '—' };
+    for (const [key, value] of Object.entries(outputs)) card.querySelector(`[data-result="${key}"]`).textContent = value;
+    const loss = isValid && result.profitUnits < 0;
+    card.classList.toggle('batch-row-loss', loss);
+    card.querySelector('[data-result="profit"]').classList.toggle('loss', loss);
+    card.querySelector('[data-batch-state]').textContent = isValid ? (loss ? '亏损商品' : result.profitUnits > 0 ? '盈利商品' : '刚好保本') : '待完善 · 不计入汇总';
+    if (isValid) valid.push({ row, result });
+  }
+  const total = valid.reduce((sum, item) => sum + item.result.profit, 0);
+  $('#batch-total').textContent = valid.length ? money(total) : '—';
+  $('#batch-total').classList.toggle('loss', total < 0);
+  $('#batch-count').textContent = `${valid.length} / ${batchRows.length} 行有效${batchRows.length > valid.length ? ` · ${batchRows.length - valid.length} 行待完善，未计入` : ''}`;
+  $('#batch-loss-count').textContent = valid.filter(item => item.result.profitUnits < 0).length;
+  if (valid.length) {
+    const bestUnits = Math.max(...valid.map(item => item.result.profitUnits));
+    const best = valid.filter(item => item.result.profitUnits === bestUnits);
+    $('#batch-best').textContent = best.map(item => item.row.name.trim()).join('、');
+    $('#batch-best-profit').textContent = `${money(best[0].result.profit)} / 件${best.length > 1 ? ` · ${best.length} 款并列` : ''}${bestUnits < 0 ? ' · 全部有效商品均亏损' : ''}`;
+  } else { $('#batch-best').textContent = '—'; $('#batch-best-profit').textContent = '添加完整有效的商品，开始比较'; }
+  $('#batch-export').disabled = !valid.length || valid.length !== batchRows.length;
+  $('#batch-clear').disabled = batchRows.length === 0;
+  $('#batch-add').disabled = batchRows.length >= 200;
+  $('#batch-empty').hidden = batchRows.length !== 0;
+}
+$('#batch-add').addEventListener('click', () => {
+  if (batchRows.length >= 200) return;
+  batchRows.push({ id: uid(), name: '', cost: '', price: '', shipping: '', rate: '' });
+  renderBatchRows(); saveBatch(); $('#batch-rows').lastElementChild.querySelector('input').focus();
+});
+$('#batch-rows').addEventListener('input', event => {
+  const input = event.target.closest('[data-field]'); if (!input) return;
+  const row = batchRows.find(item => item.id === input.closest('.batch-row').dataset.id); if (!row) return;
+  row[input.dataset.field] = input.value; updateBatch(); saveBatch();
+});
+$('#batch-rows').addEventListener('click', event => {
+  const button = event.target.closest('[data-batch-delete]'); if (!button) return;
+  const index = batchRows.findIndex(item => item.id === button.dataset.batchDelete);
+  batchRows = batchRows.filter(item => item.id !== button.dataset.batchDelete); renderBatchRows(); saveBatch();
+  const next = $('#batch-rows').children[Math.min(index, batchRows.length - 1)];
+  (next?.querySelector('input') || $('#batch-add')).focus(); toast('已删除该商品');
+});
+function clearBatchData() {
+  batchRows = [];
+  try { localStorage.removeItem(batchStorageKey); batchStorageBroken = false; $('#batch-warning').hidden = true; $('#batch-save-status').textContent = '分析数据已清空，仅保存在当前浏览器。'; }
+  catch { warnBatchStorage(); }
+  renderBatchRows();
+}
+$('#batch-clear').addEventListener('click', () => {
+  if (confirm('确定清空全部商品分析数据吗？此操作不可撤销，建议先导出 CSV。')) { clearBatchData(); $('#batch-add').focus(); toast('批量商品分析数据已清空'); }
+});
+// Quote every CSV field and neutralize spreadsheet formula prefixes in names.
+function batchCsvCell(value, userText = false) {
+  let text = String(value);
+  if (userText && /^[\s\uFEFF]*[=+@\-]/u.test(text)) text = `'${text}`;
+  return `"${text.replace(/"/g, '""')}"`;
+}
+$('#batch-export').addEventListener('click', () => {
+  const analyzed = batchRows.map(row => ({ row, result: analyzeBatchRow(row) }));
+  if (!analyzed.length || analyzed.some(item => Object.keys(item.result.errors).length)) { toast('请先完善全部商品数据再导出'); return; }
+  const header = ['商品名称', '商品成本(元)', '销售价格(元)', '运费(元)', '平台费率(%)', '单件利润(元)', '利润率(%)', '平台费用(元)', '保本售价(元)', '状态'];
+  const records = analyzed.map(({ row, result: r }) => [
+    batchCsvCell(row.name.trim(), true), ...['cost', 'price', 'shipping', 'rate'].map(key => batchCsvCell(Number(row[key]).toFixed(2))),
+    ...[r.profit, r.margin, r.fee].map(value => batchCsvCell(value.toFixed(2))),
+    batchCsvCell(r.breakEven === null ? r.breakEvenText : r.breakEven.toFixed(2)),
+    batchCsvCell(r.profitUnits < 0 ? '亏损' : r.profitUnits > 0 ? '盈利' : '保本')
+  ].join(','));
+  const total = analyzed.reduce((sum, item) => sum + item.result.profit, 0);
+  const summary = ['总利润（每种商品各一件）', '', '', '', '', total.toFixed(2), '', '', '', ''].map(value => batchCsvCell(value)).join(',');
+  download('批量商品利润分析.csv', `\uFEFF${header.map(value => batchCsvCell(value)).join(',')}\r\n${records.join('\r\n')}\r\n${summary}\r\n`, 'text/csv;charset=utf-8');
+});
+renderBatchRows();
+
 $('#year').textContent = new Date().getFullYear();
 renderFavorites(); renderPrompts(); route();
